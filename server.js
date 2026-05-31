@@ -52,7 +52,17 @@ io.on("connection", (socket) => {
     const safeUsername = (typeof username === "string" ? username : "Anonymous").slice(0, 32);
 
     if (safeRole === "host") {
-      const code = generateRoomCode();
+      const requested = (typeof data.requestedCode === "string" ? data.requestedCode : "").toUpperCase().trim();
+      let code;
+      if (requested && /^[A-Z0-9]{6}$/.test(requested)) {
+        if (rooms.has(requested)) {
+          socket.emit("error", { message: "Room code already in use." });
+          return;
+        }
+        code = requested;
+      } else {
+        code = generateRoomCode();
+      }
       rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false });
       clients.set(socket.id, { role: "host", username: safeUsername, roomCode: code });
       socket.join(code);
