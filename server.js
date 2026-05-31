@@ -14,15 +14,31 @@ app.use(express.json());
 
 const PORT = 3000;
 
+// rooms: Map<roomCode, { hostId: string|null, guests: Set<string>, cohostMode: boolean }>
+const rooms = new Map();
+// clients: Map<socketId, { role, username, roomCode }>
 const clients = new Map();
-let cohostMode = false; // toggled by host, broadcast to all
+
+const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function generateRoomCode() {
+  let code;
+  do {
+    code = Array.from({ length: 6 }, () =>
+      ROOM_CODE_CHARS[Math.floor(Math.random() * ROOM_CODE_CHARS.length)]
+    ).join("");
+  } while (rooms.has(code));
+  return code;
+}
 
 app.get("/status", (req, res) => {
   res.json({
-    connected: clients.size,
-    hosts: getHostCount(),
-    guests: getGuestCount(),
-    cohostMode,
+    totalClients: clients.size,
+    rooms: [...rooms.entries()].map(([code, r]) => ({
+      code,
+      hosts: r.hostId ? 1 : 0,
+      guests: r.guests.size,
+      cohostMode: r.cohostMode,
+    })),
   });
 });
 
@@ -31,50 +47,52 @@ io.on("connection", (socket) => {
 
   socket.on("register", (data) => {
     if (!data || typeof data !== "object") return;
-    const { role, username } = data;
+    const { role, username, roomCode } = data;
     const safeRole = role === "host" ? "host" : "guest";
     const safeUsername = (typeof username === "string" ? username : "Anonymous").slice(0, 32);
 
     if (safeRole === "host") {
-      const existingHost = [...clients.values()].find((c) => c.role === "host");
-      if (existingHost) {
-        socket.emit("error", { message: "A host is already connected." });
+      const code = generateRoomCode();
+      rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false });
+      clients.set(socket.id, { role: "host", username: safeUsername, roomCode: code });
+      socket.join(code);
+      socket.emit("registered", { role: "host", username: safeUsername });
+      socket.emit("room_created", { code });
+      console.log(`[~] ${safeUsername} created room ${code}`);
+      broadcastRoomUpdate(code);
+    } else {
+      const safeCode = (typeof roomCode === "string" ? roomCode : "").toUpperCase().trim();
+      const room = rooms.get(safeCode);
+      if (!room) {
+        socket.emit("error", { message: "Room not found. Check the code and try again." });
         return;
       }
+      room.guests.add(socket.id);
+      clients.set(socket.id, { role: "guest", username: safeUsername, roomCode: safeCode });
+      socket.join(safeCode);
+      socket.emit("registered", { role: "guest", username: safeUsername });
+      socket.emit("cohost_mode_changed", { enabled: room.cohostMode });
+      if (!room.hostId) socket.emit("waiting_for_host");
+      console.log(`[~] ${safeUsername} joined room ${safeCode} as guest`);
+      broadcastRoomUpdate(safeCode);
     }
-
-    clients.set(socket.id, { role: safeRole, username: safeUsername });
-    socket.join(safeRole === "host" ? "hosts" : "guests");
-    socket.emit("registered", { role: safeRole, username: safeUsername });
-
-    // Tell new guest the current co-host state
-    if (safeRole === "guest") {
-      socket.emit("cohost_mode_changed", { enabled: cohostMode });
-    }
-
-    if (safeRole === "host") {
-      socket.to("guests").emit("host_connected");
-    }
-
-    console.log(`[~] ${safeUsername} registered as ${safeRole}`);
-    broadcastRoomUpdate();
   });
 
-  // Host toggles co-host mode
   socket.on("set_cohost_mode", (data) => {
-    if (!isHost(socket.id)) return;
-    cohostMode = Boolean(data?.enabled);
-    console.log(`[co-host] mode ${cohostMode ? "enabled" : "disabled"}`);
-    io.emit("cohost_mode_changed", { enabled: cohostMode });
+    const client = clients.get(socket.id);
+    if (!client || client.role !== "host") return;
+    const room = rooms.get(client.roomCode);
+    if (!room) return;
+    room.cohostMode = Boolean(data?.enabled);
+    console.log(`[co-host] room ${client.roomCode}: ${room.cohostMode ? "enabled" : "disabled"}`);
+    io.to(client.roomCode).emit("cohost_mode_changed", { enabled: room.cohostMode });
   });
-
-  // Playback events: accepted from host always, from guests only in co-host mode.
-  // socket.broadcast sends to everyone EXCEPT sender — prevents self-echo.
 
   socket.on("play", (data) => {
-    if (!canControl(socket.id) || !data || typeof data !== "object") return;
+    const client = clients.get(socket.id);
+    if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
     if (typeof data.uri !== "string") return;
-    socket.broadcast.emit("play", {
+    socket.to(client.roomCode).emit("play", {
       uri:        data.uri,
       position:   typeof data.position === "number" ? data.position : 0,
       contextUri: typeof data.contextUri === "string" ? data.contextUri : null,
@@ -82,26 +100,29 @@ io.on("connection", (socket) => {
   });
 
   socket.on("pause", (data) => {
-    if (!canControl(socket.id) || !data || typeof data !== "object") return;
-    socket.broadcast.emit("pause", {
+    const client = clients.get(socket.id);
+    if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
+    socket.to(client.roomCode).emit("pause", {
       position: typeof data.position === "number" ? data.position : 0,
     });
   });
 
   socket.on("seek", (data) => {
-    if (!canControl(socket.id) || !data || typeof data !== "object") return;
+    const client = clients.get(socket.id);
+    if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
     if (typeof data.position !== "number") return;
-    socket.broadcast.emit("seek", {
+    socket.to(client.roomCode).emit("seek", {
       position: data.position,
       sentAt:   typeof data.sentAt === "number" ? data.sentAt : Date.now(),
     });
   });
 
   socket.on("change_track", (data) => {
-    if (!canControl(socket.id) || !data || typeof data !== "object") return;
+    const client = clients.get(socket.id);
+    if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
     if (typeof data.uri !== "string") return;
-    console.log(`[>>|] change_track: ${data.uri}`);
-    socket.broadcast.emit("change_track", {
+    console.log(`[>>|] room ${client.roomCode} change_track: ${data.uri}`);
+    socket.to(client.roomCode).emit("change_track", {
       uri:        data.uri,
       position:   typeof data.position === "number" ? data.position : 0,
       contextUri: typeof data.contextUri === "string" ? data.contextUri : null,
@@ -109,18 +130,23 @@ io.on("connection", (socket) => {
   });
 
   socket.on("request_sync", () => {
-    const host = [...io.sockets.sockets.values()].find(
-      (s) => clients.get(s.id)?.role === "host"
-    );
-    if (host) {
-      host.emit("sync_requested", { guestId: socket.id });
-    } else {
-      socket.emit("waiting_for_host");
+    const client = clients.get(socket.id);
+    if (!client) return;
+    const room = rooms.get(client.roomCode);
+    if (!room) return;
+    if (room.hostId) {
+      const hostSocket = io.sockets.sockets.get(room.hostId);
+      if (hostSocket) {
+        hostSocket.emit("sync_requested", { guestId: socket.id });
+        return;
+      }
     }
+    socket.emit("waiting_for_host");
   });
 
   socket.on("sync_state", (data) => {
-    if (!isHost(socket.id) || !data || typeof data !== "object") return;
+    const client = clients.get(socket.id);
+    if (!client || client.role !== "host" || !data || typeof data !== "object") return;
     if (typeof data.guestId !== "string" || typeof data.uri !== "string") return;
     const target = io.sockets.sockets.get(data.guestId);
     if (target) {
@@ -137,43 +163,49 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     const client = clients.get(socket.id);
     if (!client) return;
-    console.log(`[-] ${client.username} (${client.role}) disconnected`);
-    const wasHost = client.role === "host";
+    console.log(`[-] ${client.username} (${client.role}) left room ${client.roomCode}`);
+    const room = rooms.get(client.roomCode);
     clients.delete(socket.id);
-    if (wasHost) {
-      if (cohostMode) {
-        cohostMode = false;
-        io.to("guests").emit("cohost_mode_changed", { enabled: false });
+    if (!room) return;
+
+    if (client.role === "host") {
+      room.hostId = null;
+      if (room.cohostMode) {
+        room.cohostMode = false;
+        io.to(client.roomCode).emit("cohost_mode_changed", { enabled: false });
       }
-      io.to("guests").emit("host_left");
+      io.to(client.roomCode).emit("host_left");
+      if (room.guests.size === 0) {
+        rooms.delete(client.roomCode);
+        console.log(`[x] Room ${client.roomCode} closed`);
+      }
+    } else {
+      room.guests.delete(socket.id);
+      if (!room.hostId && room.guests.size === 0) {
+        rooms.delete(client.roomCode);
+        console.log(`[x] Room ${client.roomCode} closed`);
+      } else {
+        broadcastRoomUpdate(client.roomCode);
+      }
     }
-    broadcastRoomUpdate();
   });
 });
-
-function isHost(socketId) {
-  return clients.get(socketId)?.role === "host";
-}
 
 function canControl(socketId) {
   const c = clients.get(socketId);
   if (!c) return false;
-  return c.role === "host" || (c.role === "guest" && cohostMode);
+  const room = rooms.get(c.roomCode);
+  if (!room) return false;
+  return c.role === "host" || (c.role === "guest" && room.cohostMode);
 }
 
-function getHostCount() {
-  return [...clients.values()].filter((c) => c.role === "host").length;
-}
-
-function getGuestCount() {
-  return [...clients.values()].filter((c) => c.role === "guest").length;
-}
-
-function broadcastRoomUpdate() {
-  io.emit("room_update", {
-    connected: clients.size,
-    hosts: getHostCount(),
-    guests: getGuestCount(),
+function broadcastRoomUpdate(roomCode) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  io.to(roomCode).emit("room_update", {
+    connected: (room.hostId ? 1 : 0) + room.guests.size,
+    hosts:  room.hostId ? 1 : 0,
+    guests: room.guests.size,
   });
 }
 
