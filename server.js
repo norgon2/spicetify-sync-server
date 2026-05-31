@@ -30,6 +30,15 @@ function generateRoomCode() {
   return code;
 }
 
+// Fix 5: shared helper — wires a host socket into an already-existing room entry
+function finalizeHostRegistration(socket, code, safeUsername) {
+  clients.set(socket.id, { role: "host", username: safeUsername, roomCode: code });
+  socket.join(code);
+  socket.emit("registered", { role: "host", username: safeUsername });
+  socket.emit("room_created", { code });
+  broadcastRoomUpdate(code);
+}
+
 app.get("/status", (req, res) => {
   res.json({
     totalClients: clients.size,
@@ -54,7 +63,8 @@ io.on("connection", (socket) => {
     if (safeRole === "host") {
       const requested = (typeof data.requestedCode === "string" ? data.requestedCode : "").toUpperCase().trim();
       let code;
-      if (requested && /^[A-Z0-9]{6}$/.test(requested)) {
+      // Fix 2: regex matches ROOM_CODE_CHARS exactly — rejects ambiguous I, O, 0, 1
+      if (requested && /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/.test(requested)) {
         if (rooms.has(requested)) {
           const existing = rooms.get(requested);
           if (existing.hostId !== null) {
@@ -64,13 +74,10 @@ io.on("connection", (socket) => {
           // Reclaim: room exists but host disconnected, guests still waiting
           existing.hostId = socket.id;
           existing.cohostMode = false;
-          clients.set(socket.id, { role: "host", username: safeUsername, roomCode: requested });
-          socket.join(requested);
-          socket.emit("registered", { role: "host", username: safeUsername });
-          socket.emit("room_created", { code: requested });
+          finalizeHostRegistration(socket, requested, safeUsername); // Fix 5
+          socket.emit("cohost_mode_changed", { enabled: false });    // Fix 4
           console.log(`[~] ${safeUsername} reclaimed room ${requested}`);
           if (existing.guests.size > 0) socket.to(requested).emit("host_connected");
-          broadcastRoomUpdate(requested);
           return;
         }
         code = requested;
@@ -78,12 +85,8 @@ io.on("connection", (socket) => {
         code = generateRoomCode();
       }
       rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false });
-      clients.set(socket.id, { role: "host", username: safeUsername, roomCode: code });
-      socket.join(code);
-      socket.emit("registered", { role: "host", username: safeUsername });
-      socket.emit("room_created", { code });
+      finalizeHostRegistration(socket, code, safeUsername); // Fix 5
       console.log(`[~] ${safeUsername} created room ${code}`);
-      broadcastRoomUpdate(code);
     } else {
       const safeCode = (typeof roomCode === "string" ? roomCode : "").toUpperCase().trim();
       const room = rooms.get(safeCode);
@@ -172,6 +175,9 @@ io.on("connection", (socket) => {
     const client = clients.get(socket.id);
     if (!client || client.role !== "host" || !data || typeof data !== "object") return;
     if (typeof data.guestId !== "string" || typeof data.uri !== "string") return;
+    // Fix 1: verify target belongs to the same room as the sending host
+    const targetClient = clients.get(data.guestId);
+    if (!targetClient || targetClient.roomCode !== client.roomCode) return;
     const target = io.sockets.sockets.get(data.guestId);
     if (target) {
       target.emit("sync_state", {
@@ -208,6 +214,8 @@ io.on("connection", (socket) => {
       if (room.guests.size === 0) {
         rooms.delete(client.roomCode);
         console.log(`[x] Room ${client.roomCode} closed`);
+      } else {
+        broadcastRoomUpdate(client.roomCode); // Fix 3: refresh count for waiting guests
       }
     } else {
       room.guests.delete(socket.id);
