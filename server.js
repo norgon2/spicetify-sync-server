@@ -56,7 +56,21 @@ io.on("connection", (socket) => {
       let code;
       if (requested && /^[A-Z0-9]{6}$/.test(requested)) {
         if (rooms.has(requested)) {
-          socket.emit("error", { message: "Room code already in use." });
+          const existing = rooms.get(requested);
+          if (existing.hostId !== null) {
+            socket.emit("error", { message: "Room code already in use." });
+            return;
+          }
+          // Reclaim: room exists but host disconnected, guests still waiting
+          existing.hostId = socket.id;
+          existing.cohostMode = false;
+          clients.set(socket.id, { role: "host", username: safeUsername, roomCode: requested });
+          socket.join(requested);
+          socket.emit("registered", { role: "host", username: safeUsername });
+          socket.emit("room_created", { code: requested });
+          console.log(`[~] ${safeUsername} reclaimed room ${requested}`);
+          if (existing.guests.size > 0) socket.to(requested).emit("host_connected");
+          broadcastRoomUpdate(requested);
           return;
         }
         code = requested;
@@ -168,6 +182,12 @@ io.on("connection", (socket) => {
         sentAt:     typeof data.sentAt === "number" ? data.sentAt : null,
       });
     }
+  });
+
+  socket.on("volume_change", (data) => {
+    const client = clients.get(socket.id);
+    if (!client || !canControl(socket.id) || typeof data?.volume !== "number") return;
+    socket.to(client.roomCode).emit("volume_change", { volume: data.volume });
   });
 
   socket.on("disconnect", () => {
