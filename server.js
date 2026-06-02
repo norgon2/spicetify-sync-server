@@ -287,6 +287,19 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on("sync_ping", (data) => {
+    const client = clients.get(socket.id);
+    if (!client || client.role !== "host" || !data || typeof data !== "object") return;
+    if (typeof data.uri !== "string" || !SPOTIFY_URI_RE.test(data.uri)) return;
+    if (!checkEventRate(socket.id)) return;
+    broadcastPlayback(socket, client, "sync_ping", {
+      uri:       data.uri,
+      position:  safePosition(data.position),
+      isPlaying: Boolean(data.isPlaying),
+      sentAt:    typeof data.sentAt === "number" && isFinite(data.sentAt) ? data.sentAt : Date.now(),
+    });
+  });
+
   socket.on("volume_change", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id)) return;
