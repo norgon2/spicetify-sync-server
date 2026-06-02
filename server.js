@@ -10,11 +10,15 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
-app.use(cors());
+// No global HTTP CORS — socket.io handles its own; HTTP routes are localhost-only
 app.use(express.json());
 
 const PORT = 3000;
-const PROTOCOL_VERSION = 1; // Item 9: must match extension
+const PROTOCOL_VERSION = 1;
+const MAX_POSITION_MS  = 86400000;
+
+// Fix 5: strict Spotify URI pattern, same as client
+const SPOTIFY_URI_RE = /^spotify:[a-z]+:[A-Za-z0-9]{22}$/;
 
 // rooms: Map<roomCode, { hostId: string|null, guests: Set<string>, cohostMode: boolean }>
 const rooms = new Map();
@@ -22,17 +26,18 @@ const rooms = new Map();
 const clients = new Map();
 
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+// Fix 11: max attempts to avoid infinite loop
 function generateRoomCode() {
-  let code;
-  do {
-    code = Array.from({ length: 6 }, () =>
+  for (let i = 0; i < 50; i++) {
+    const code = Array.from({ length: 6 }, () =>
       ROOM_CODE_CHARS[crypto.randomInt(ROOM_CODE_CHARS.length)]
     ).join("");
-  } while (rooms.has(code));
-  return code;
+    if (!rooms.has(code)) return code;
+  }
+  return null;
 }
 
-// Fix 5: shared helper — wires a host socket into an already-existing room entry
 function finalizeHostRegistration(socket, code, safeUsername) {
   clients.set(socket.id, { role: "host", username: safeUsername, roomCode: code });
   socket.join(code);
@@ -41,6 +46,7 @@ function finalizeHostRegistration(socket, code, safeUsername) {
   broadcastRoomUpdate(code);
 }
 
+// --- Registration rate limiting (5/min per IP) ---
 const registerAttempts = new Map();
 const REGISTER_LIMIT  = 5;
 const REGISTER_WINDOW = 60_000;
@@ -63,7 +69,45 @@ setInterval(() => {
     if (now > entry.resetAt) registerAttempts.delete(ip);
 }, REGISTER_WINDOW).unref();
 
+// --- Fix 6: playback event rate limiting (10 events/s per socket) ---
+const socketEventCounters = new Map();
+const SOCKET_EVENT_RATE   = 10;
+const SOCKET_EVENT_WINDOW = 1000;
+
+function checkEventRate(socketId) {
+  const now   = Date.now();
+  const entry = socketEventCounters.get(socketId);
+  if (!entry || now > entry.resetAt) {
+    socketEventCounters.set(socketId, { count: 1, resetAt: now + SOCKET_EVENT_WINDOW });
+    return true;
+  }
+  if (entry.count >= SOCKET_EVENT_RATE) return false;
+  entry.count++;
+  return true;
+}
+
+// Fix 8: safe position — must be finite number in [0, MAX_POSITION_MS]
+function safePosition(v, fallback = 0) {
+  return typeof v === "number" && isFinite(v) && v >= 0 && v <= MAX_POSITION_MS
+    ? v
+    : fallback;
+}
+
+// Fix 14: broadcast playback to room, excluding sender; if sender is guest co-host,
+// also exclude the host (host controls their own playback independently).
+function broadcastPlayback(socket, client, event, data) {
+  const room     = rooms.get(client.roomCode);
+  const excluded = [socket.id];
+  if (client.role === "guest" && room?.hostId) excluded.push(room.hostId);
+  io.to(client.roomCode).except(excluded).emit(event, data);
+}
+
+// Fix 7: /status is localhost-only
 app.get("/status", (req, res) => {
+  const ip = req.socket.remoteAddress;
+  if (ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1") {
+    return res.status(403).end();
+  }
   let hosts = 0, guests = 0;
   for (const c of clients.values()) c.role === "host" ? hosts++ : guests++;
   res.json({ connected: clients.size, hosts, guests });
@@ -84,13 +128,12 @@ io.on("connection", (socket) => {
       return;
     }
     const { role, username, roomCode } = data;
-    const safeRole = role === "host" ? "host" : "guest";
+    const safeRole     = role === "host" ? "host" : "guest";
     const safeUsername = (typeof username === "string" ? username : "Anonymous").slice(0, 32);
 
     if (safeRole === "host") {
       const requested = (typeof data.requestedCode === "string" ? data.requestedCode : "").toUpperCase().trim();
       let code;
-      // Fix 2: regex matches ROOM_CODE_CHARS exactly — rejects ambiguous I, O, 0, 1
       if (requested && /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/.test(requested)) {
         if (rooms.has(requested)) {
           const existing = rooms.get(requested);
@@ -98,21 +141,29 @@ io.on("connection", (socket) => {
             socket.emit("error", { message: "Room code already in use." });
             return;
           }
-          // Reclaim: room exists but host disconnected, guests still waiting
-          existing.hostId = socket.id;
+          existing.hostId    = socket.id;
           existing.cohostMode = false;
-          finalizeHostRegistration(socket, requested, safeUsername); // Fix 5
-          socket.emit("cohost_mode_changed", { enabled: false });    // Fix 4
+          finalizeHostRegistration(socket, requested, safeUsername);
+          socket.emit("cohost_mode_changed", { enabled: false });
           console.log(`[~] ${safeUsername} reclaimed room ${requested}`);
           if (existing.guests.size > 0) socket.to(requested).emit("host_connected");
+          // Fix 15: reset rate limit on successful registration
+          registerAttempts.delete(socket.handshake.address);
           return;
         }
         code = requested;
       } else {
+        // Fix 11: handle null from generateRoomCode
         code = generateRoomCode();
+        if (!code) {
+          socket.emit("error", { message: "Could not create room. Try again." });
+          return;
+        }
       }
       rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false });
-      finalizeHostRegistration(socket, code, safeUsername); // Fix 5
+      finalizeHostRegistration(socket, code, safeUsername);
+      // Fix 15: reset rate limit on successful registration
+      registerAttempts.delete(socket.handshake.address);
       console.log(`[~] ${safeUsername} created room ${code}`);
     } else {
       const safeCode = (typeof roomCode === "string" ? roomCode : "").toUpperCase().trim();
@@ -131,6 +182,8 @@ io.on("connection", (socket) => {
       socket.emit("registered", { role: "guest", username: safeUsername });
       if (room.cohostMode) socket.emit("cohost_mode_changed", { enabled: true });
       if (!room.hostId) socket.emit("waiting_for_host");
+      // Fix 15: reset rate limit on successful registration
+      registerAttempts.delete(socket.handshake.address);
       console.log(`[~] ${safeUsername} joined room ${safeCode} as guest`);
       broadcastRoomUpdate(safeCode);
     }
@@ -149,41 +202,53 @@ io.on("connection", (socket) => {
   socket.on("play", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
-    if (typeof data.uri !== "string" || !data.uri.startsWith("spotify:")) return;
-    socket.to(client.roomCode).emit("play", {
+    // Fix 5: strict URI validation
+    if (typeof data.uri !== "string" || !SPOTIFY_URI_RE.test(data.uri)) return;
+    // Fix 6: rate limit
+    if (!checkEventRate(socket.id)) return;
+    broadcastPlayback(socket, client, "play", {
       uri:        data.uri,
-      position:   typeof data.position === "number" ? data.position : 0,
-      contextUri: typeof data.contextUri === "string" ? data.contextUri : null,
+      position:   safePosition(data.position),
+      contextUri: typeof data.contextUri === "string" && SPOTIFY_URI_RE.test(data.contextUri) ? data.contextUri : null,
     });
   });
 
   socket.on("pause", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
-    socket.to(client.roomCode).emit("pause", {
-      position: typeof data.position === "number" ? data.position : 0,
+    // Fix 6: rate limit
+    if (!checkEventRate(socket.id)) return;
+    // Fix 8: isFinite check via safePosition
+    broadcastPlayback(socket, client, "pause", {
+      position: safePosition(data.position),
     });
   });
 
   socket.on("seek", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
-    if (typeof data.position !== "number") return;
-    socket.to(client.roomCode).emit("seek", {
-      position: data.position,
-      sentAt:   typeof data.sentAt === "number" ? data.sentAt : Date.now(),
+    // Fix 8: strict finite check on position
+    if (typeof data.position !== "number" || !isFinite(data.position)) return;
+    // Fix 6: rate limit
+    if (!checkEventRate(socket.id)) return;
+    broadcastPlayback(socket, client, "seek", {
+      position: safePosition(data.position),
+      sentAt:   typeof data.sentAt === "number" && isFinite(data.sentAt) ? data.sentAt : Date.now(),
     });
   });
 
   socket.on("change_track", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
-    if (typeof data.uri !== "string" || !data.uri.startsWith("spotify:")) return;
+    // Fix 5: strict URI
+    if (typeof data.uri !== "string" || !SPOTIFY_URI_RE.test(data.uri)) return;
+    // Fix 6: rate limit
+    if (!checkEventRate(socket.id)) return;
     console.log(`[>>|] room ${client.roomCode} change_track: ${data.uri}`);
-    socket.to(client.roomCode).emit("change_track", {
+    broadcastPlayback(socket, client, "change_track", {
       uri:        data.uri,
-      position:   typeof data.position === "number" ? data.position : 0,
-      contextUri: typeof data.contextUri === "string" ? data.contextUri : null,
+      position:   safePosition(data.position),
+      contextUri: typeof data.contextUri === "string" && SPOTIFY_URI_RE.test(data.contextUri) ? data.contextUri : null,
     });
   });
 
@@ -205,33 +270,36 @@ io.on("connection", (socket) => {
   socket.on("sync_state", (data) => {
     const client = clients.get(socket.id);
     if (!client || client.role !== "host" || !data || typeof data !== "object") return;
-    if (typeof data.guestId !== "string" || typeof data.uri !== "string" || !data.uri.startsWith("spotify:")) return;
-    // Fix 1: verify target belongs to the same room as the sending host
+    // Fix 5: strict URI
+    if (typeof data.guestId !== "string" || typeof data.uri !== "string" || !SPOTIFY_URI_RE.test(data.uri)) return;
     const targetClient = clients.get(data.guestId);
     if (!targetClient || targetClient.roomCode !== client.roomCode) return;
     const target = io.sockets.sockets.get(data.guestId);
     if (target) {
       target.emit("sync_state", {
         uri:        data.uri,
-        position:   typeof data.position === "number" ? data.position : 0,
+        position:   safePosition(data.position),
         isPlaying:  Boolean(data.isPlaying),
-        contextUri: typeof data.contextUri === "string" ? data.contextUri : null,
-        sentAt:     typeof data.sentAt === "number" ? data.sentAt : null,
+        contextUri: typeof data.contextUri === "string" && SPOTIFY_URI_RE.test(data.contextUri) ? data.contextUri : null,
+        sentAt:     typeof data.sentAt === "number" && isFinite(data.sentAt) ? data.sentAt : null,
       });
     }
   });
 
-  // Item 3: strict [0, 1] range validation on volume before relay
   socket.on("volume_change", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id)) return;
     const { volume } = data ?? {};
     if (typeof volume !== "number" || !isFinite(volume) || volume < 0 || volume > 1) return;
-    socket.to(client.roomCode).emit("volume_change", { volume });
+    // Fix 6: rate limit
+    if (!checkEventRate(socket.id)) return;
+    broadcastPlayback(socket, client, "volume_change", { volume });
   });
 
   socket.on("disconnect", () => {
     const client = clients.get(socket.id);
+    // Fix 6: cleanup rate limit entry
+    socketEventCounters.delete(socket.id);
     if (!client) return;
     console.log(`[-] ${client.username} (${client.role}) left room ${client.roomCode}`);
     const room = rooms.get(client.roomCode);
@@ -249,7 +317,7 @@ io.on("connection", (socket) => {
         rooms.delete(client.roomCode);
         console.log(`[x] Room ${client.roomCode} closed`);
       } else {
-        broadcastRoomUpdate(client.roomCode); // Fix 3: refresh count for waiting guests
+        broadcastRoomUpdate(client.roomCode);
       }
     } else {
       room.guests.delete(socket.id);
