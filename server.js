@@ -1,7 +1,6 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const cors   = require("cors");
 const crypto = require("crypto");
 
 const app = express();
@@ -192,6 +191,7 @@ io.on("connection", (socket) => {
   socket.on("set_cohost_mode", (data) => {
     const client = clients.get(socket.id);
     if (!client || client.role !== "host") return;
+    if (!checkEventRate(socket.id)) return;
     const room = rooms.get(client.roomCode);
     if (!room) return;
     room.cohostMode = Boolean(data?.enabled);
@@ -255,6 +255,7 @@ io.on("connection", (socket) => {
   socket.on("request_sync", () => {
     const client = clients.get(socket.id);
     if (!client) return;
+    if (!checkEventRate(socket.id)) return;
     const room = rooms.get(client.roomCode);
     if (!room) return;
     if (room.hostId) {
