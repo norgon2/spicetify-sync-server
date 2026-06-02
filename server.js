@@ -38,7 +38,7 @@ function generateRoomCode() {
 }
 
 function finalizeHostRegistration(socket, code, safeUsername) {
-  clients.set(socket.id, { role: "host", username: safeUsername, roomCode: code });
+  clients.set(socket.id, { role: "host", username: safeUsername, roomCode: code, connectedAt: Date.now() });
   socket.join(code);
   socket.emit("registered", { role: "host", username: safeUsername });
   socket.emit("room_created", { code });
@@ -145,6 +145,7 @@ io.on("connection", (socket) => {
           finalizeHostRegistration(socket, requested, safeUsername);
           socket.emit("cohost_mode_changed", { enabled: false });
           console.log(`[~] ${safeUsername} reclaimed room ${requested}`);
+          broadcastParticipants(requested);
           if (existing.guests.size > 0) socket.to(requested).emit("host_connected");
           // Fix 15: reset rate limit on successful registration
           registerAttempts.delete(socket.handshake.address);
@@ -161,6 +162,7 @@ io.on("connection", (socket) => {
       }
       rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false, skipVotes: new Set() });
       finalizeHostRegistration(socket, code, safeUsername);
+      broadcastParticipants(code);
       // Fix 15: reset rate limit on successful registration
       registerAttempts.delete(socket.handshake.address);
       console.log(`[~] ${safeUsername} created room ${code}`);
@@ -176,7 +178,7 @@ io.on("connection", (socket) => {
         return;
       }
       room.guests.add(socket.id);
-      clients.set(socket.id, { role: "guest", username: safeUsername, roomCode: safeCode });
+      clients.set(socket.id, { role: "guest", username: safeUsername, roomCode: safeCode, connectedAt: Date.now() });
       socket.join(safeCode);
       socket.emit("registered", { role: "guest", username: safeUsername });
       if (room.cohostMode) socket.emit("cohost_mode_changed", { enabled: true });
@@ -185,6 +187,7 @@ io.on("connection", (socket) => {
       registerAttempts.delete(socket.handshake.address);
       console.log(`[~] ${safeUsername} joined room ${safeCode} as guest`);
       broadcastRoomUpdate(safeCode);
+      broadcastParticipants(safeCode);
     }
   });
 
@@ -197,6 +200,7 @@ io.on("connection", (socket) => {
     room.cohostMode = Boolean(data?.enabled);
     console.log(`[co-host] room ${client.roomCode}: ${room.cohostMode ? "enabled" : "disabled"}`);
     io.to(client.roomCode).emit("cohost_mode_changed", { enabled: room.cohostMode });
+    broadcastParticipants(client.roomCode);
   });
 
   socket.on("play", (data) => {
@@ -347,12 +351,28 @@ io.on("connection", (socket) => {
         io.to(client.roomCode).emit("cohost_mode_changed", { enabled: false });
       }
       room.skipVotes?.clear();
-      io.to(client.roomCode).emit("host_left");
       if (room.guests.size === 0) {
         rooms.delete(client.roomCode);
         console.log(`[x] Room ${client.roomCode} closed`);
       } else {
-        broadcastRoomUpdate(client.roomCode);
+        // Auto-promote oldest connected guest
+        const sorted = [...room.guests]
+          .map(id => ({ id, c: clients.get(id) }))
+          .filter(x => x.c)
+          .sort((a, b) => a.c.connectedAt - b.c.connectedAt);
+        if (sorted.length > 0) {
+          const { id: newId, c: newClient } = sorted[0];
+          room.hostId = newId;
+          room.guests.delete(newId);
+          clients.set(newId, { ...newClient, role: "host" });
+          console.log(`[~] Auto-promoted ${newClient.username} to host in room ${client.roomCode}`);
+          io.sockets.sockets.get(newId)?.emit("promoted_to_host");
+          broadcastRoomUpdate(client.roomCode);
+          broadcastParticipants(client.roomCode);
+        } else {
+          io.to(client.roomCode).emit("host_left");
+          broadcastRoomUpdate(client.roomCode);
+        }
       }
     } else {
       room.guests.delete(socket.id);
@@ -362,8 +382,73 @@ io.on("connection", (socket) => {
         console.log(`[x] Room ${client.roomCode} closed`);
       } else {
         broadcastRoomUpdate(client.roomCode);
+        broadcastParticipants(client.roomCode);
       }
     }
+  });
+
+  socket.on("promote_guest", (data) => {
+    const client = clients.get(socket.id);
+    if (!client || client.role !== "host" || !data || typeof data !== "object") return;
+    const room = rooms.get(client.roomCode);
+    if (!room) return;
+    const targetId = typeof data.targetId === "string" ? data.targetId : null;
+    if (!targetId || !room.guests.has(targetId)) return;
+    const targetClient = clients.get(targetId);
+    if (!targetClient) return;
+    room.hostId = targetId;
+    room.guests.delete(targetId);
+    room.guests.add(socket.id);
+    clients.set(targetId, { ...targetClient, role: "host" });
+    clients.set(socket.id, { ...client, role: "guest" });
+    console.log(`[~] ${client.username} promoted ${targetClient.username} to host in ${client.roomCode}`);
+    io.sockets.sockets.get(targetId)?.emit("promoted_to_host");
+    broadcastRoomUpdate(client.roomCode);
+    broadcastParticipants(client.roomCode);
+  });
+
+  socket.on("kick_participant", (data) => {
+    const client = clients.get(socket.id);
+    if (!client || client.role !== "host" || !data || typeof data !== "object") return;
+    const room = rooms.get(client.roomCode);
+    if (!room) return;
+    const targetId = typeof data.targetId === "string" ? data.targetId : null;
+    if (!targetId || !room.guests.has(targetId)) return;
+    if (!checkEventRate(socket.id)) return;
+    const targetSock = io.sockets.sockets.get(targetId);
+    if (targetSock) { targetSock.emit("kicked"); targetSock.disconnect(true); }
+  });
+
+  socket.on("promote_guest", (data) => {
+    const client = clients.get(socket.id);
+    if (!client || client.role !== "host" || !data || typeof data !== "object") return;
+    const room = rooms.get(client.roomCode);
+    if (!room) return;
+    const targetId = typeof data.targetId === "string" ? data.targetId : null;
+    if (!targetId || !room.guests.has(targetId)) return;
+    const targetClient = clients.get(targetId);
+    if (!targetClient) return;
+    room.hostId = targetId;
+    room.guests.delete(targetId);
+    room.guests.add(socket.id);
+    clients.set(targetId, { ...targetClient, role: "host" });
+    clients.set(socket.id, { ...client, role: "guest" });
+    console.log(`[~] ${client.username} promoted ${targetClient.username} to host in ${client.roomCode}`);
+    io.sockets.sockets.get(targetId)?.emit("promoted_to_host");
+    broadcastRoomUpdate(client.roomCode);
+    broadcastParticipants(client.roomCode);
+  });
+
+  socket.on("kick_participant", (data) => {
+    const client = clients.get(socket.id);
+    if (!client || client.role !== "host" || !data || typeof data !== "object") return;
+    const room = rooms.get(client.roomCode);
+    if (!room) return;
+    const targetId = typeof data.targetId === "string" ? data.targetId : null;
+    if (!targetId || !room.guests.has(targetId)) return;
+    if (!checkEventRate(socket.id)) return;
+    const targetSock = io.sockets.sockets.get(targetId);
+    if (targetSock) { targetSock.emit("kicked"); targetSock.disconnect(true); }
   });
 });
 
@@ -373,6 +458,36 @@ function canControl(socketId) {
   const room = rooms.get(c.roomCode);
   if (!room) return false;
   return c.role === "host" || (c.role === "guest" && room.cohostMode);
+}
+
+function broadcastParticipants(roomCode) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  const list = [];
+  if (room.hostId) {
+    const h = clients.get(room.hostId);
+    if (h) list.push({ id: room.hostId, username: h.username, role: "host", connectedAt: h.connectedAt });
+  }
+  for (const gId of room.guests) {
+    const g = clients.get(gId);
+    if (g) list.push({ id: gId, username: g.username, role: room.cohostMode ? "cohost" : "guest", connectedAt: g.connectedAt });
+  }
+  io.to(roomCode).emit("participants_update", { participants: list });
+}
+
+function broadcastParticipants(roomCode) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  const list = [];
+  if (room.hostId) {
+    const h = clients.get(room.hostId);
+    if (h) list.push({ id: room.hostId, username: h.username, role: "host", connectedAt: h.connectedAt });
+  }
+  for (const gId of room.guests) {
+    const g = clients.get(gId);
+    if (g) list.push({ id: gId, username: g.username, role: room.cohostMode ? "cohost" : "guest", connectedAt: g.connectedAt });
+  }
+  io.to(roomCode).emit("participants_update", { participants: list });
 }
 
 function broadcastRoomUpdate(roomCode) {
