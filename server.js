@@ -13,6 +13,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = 3000;
+const PROTOCOL_VERSION = 1; // Item 9: must match extension
 
 // rooms: Map<roomCode, { hostId: string|null, guests: Set<string>, cohostMode: boolean }>
 const rooms = new Map();
@@ -56,6 +57,11 @@ io.on("connection", (socket) => {
 
   socket.on("register", (data) => {
     if (!data || typeof data !== "object") return;
+    // Item 9: reject incompatible protocol versions
+    if (data.version !== PROTOCOL_VERSION) {
+      socket.emit("error", { message: `Version incompatible (got ${data.version}, expected ${PROTOCOL_VERSION}). Update your extension.` });
+      return;
+    }
     const { role, username, roomCode } = data;
     const safeRole = role === "host" ? "host" : "guest";
     const safeUsername = (typeof username === "string" ? username : "Anonymous").slice(0, 32);
@@ -190,10 +196,13 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Item 3: strict [0, 1] range validation on volume before relay
   socket.on("volume_change", (data) => {
     const client = clients.get(socket.id);
-    if (!client || !canControl(socket.id) || typeof data?.volume !== "number") return;
-    socket.to(client.roomCode).emit("volume_change", { volume: data.volume });
+    if (!client || !canControl(socket.id)) return;
+    const { volume } = data ?? {};
+    if (typeof volume !== "number" || !isFinite(volume) || volume < 0 || volume > 1) return;
+    socket.to(client.roomCode).emit("volume_change", { volume });
   });
 
   socket.on("disconnect", () => {
