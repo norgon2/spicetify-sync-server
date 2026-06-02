@@ -18,6 +18,7 @@ const MAX_POSITION_MS  = 86400000;
 
 // Fix 5: strict Spotify URI pattern, same as client
 const SPOTIFY_URI_RE = /^spotify:[a-z]+:[A-Za-z0-9]{22}$/;
+const ALLOWED_REACTIONS = new Set(["❤️", "🔥", "😂", "😢", "🎉", "👏"]);
 
 // rooms: Map<roomCode, { hostId: string|null, guests: Set<string>, cohostMode: boolean }>
 const rooms = new Map();
@@ -159,7 +160,7 @@ io.on("connection", (socket) => {
           return;
         }
       }
-      rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false });
+      rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false, skipVotes: new Set() });
       finalizeHostRegistration(socket, code, safeUsername);
       // Fix 15: reset rate limit on successful registration
       registerAttempts.delete(socket.handshake.address);
@@ -245,6 +246,8 @@ io.on("connection", (socket) => {
     // Fix 6: rate limit
     if (!checkEventRate(socket.id)) return;
     console.log(`[>>|] room ${client.roomCode} change_track: ${data.uri}`);
+    const rtRoom = rooms.get(client.roomCode);
+    if (rtRoom?.skipVotes?.size) { rtRoom.skipVotes.clear(); io.to(client.roomCode).emit("skip_votes_cleared"); }
     broadcastPlayback(socket, client, "change_track", {
       uri:        data.uri,
       position:   safePosition(data.position),
@@ -300,6 +303,33 @@ io.on("connection", (socket) => {
     });
   });
 
+  socket.on("reaction", (data) => {
+    const client = clients.get(socket.id);
+    if (!client || !data || typeof data !== "object") return;
+    const { emoji } = data;
+    if (typeof emoji !== "string" || !ALLOWED_REACTIONS.has(emoji)) return;
+    if (!checkEventRate(socket.id)) return;
+    io.to(client.roomCode).emit("reaction", { emoji, username: client.username.slice(0, 32) });
+  });
+
+  socket.on("vote_skip", () => {
+    const client = clients.get(socket.id);
+    if (!client || client.role !== "guest") return;
+    const room = rooms.get(client.roomCode);
+    if (!room || !room.hostId) return;
+    if (!checkEventRate(socket.id)) return;
+    room.skipVotes.add(socket.id);
+    const count  = room.skipVotes.size;
+    const needed = Math.ceil(room.guests.size / 2) || 1;
+    io.to(client.roomCode).emit("vote_count", { count, total: room.guests.size, needed });
+    if (count >= needed) {
+      const hostSock = io.sockets.sockets.get(room.hostId);
+      if (hostSock) hostSock.emit("skip_threshold_reached");
+      room.skipVotes.clear();
+      io.to(client.roomCode).emit("skip_votes_cleared");
+    }
+  });
+
   socket.on("volume_change", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id)) return;
@@ -326,6 +356,7 @@ io.on("connection", (socket) => {
         room.cohostMode = false;
         io.to(client.roomCode).emit("cohost_mode_changed", { enabled: false });
       }
+      room.skipVotes?.clear();
       io.to(client.roomCode).emit("host_left");
       if (room.guests.size === 0) {
         rooms.delete(client.roomCode);
@@ -335,6 +366,7 @@ io.on("connection", (socket) => {
       }
     } else {
       room.guests.delete(socket.id);
+      room.skipVotes?.delete(socket.id);
       if (!room.hostId && room.guests.size === 0) {
         rooms.delete(client.roomCode);
         console.log(`[x] Room ${client.roomCode} closed`);
