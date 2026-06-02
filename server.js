@@ -18,7 +18,6 @@ const MAX_POSITION_MS  = 86400000;
 
 // Fix 5: strict Spotify URI pattern, same as client
 const SPOTIFY_URI_RE = /^spotify:[a-z]+:[A-Za-z0-9]{22}$/;
-const ALLOWED_REACTIONS = new Set(["❤️", "🔥", "😂", "😢", "🎉", "👏"]);
 
 // rooms: Map<roomCode, { hostId: string|null, guests: Set<string>, cohostMode: boolean }>
 const rooms = new Map();
@@ -301,15 +300,6 @@ io.on("connection", (socket) => {
       isPlaying: Boolean(data.isPlaying),
       sentAt:    typeof data.sentAt === "number" && isFinite(data.sentAt) ? data.sentAt : Date.now(),
     });
-  });
-
-  socket.on("reaction", (data) => {
-    const client = clients.get(socket.id);
-    if (!client || !data || typeof data !== "object") return;
-    const { emoji } = data;
-    if (typeof emoji !== "string" || !ALLOWED_REACTIONS.has(emoji)) return;
-    if (!checkEventRate(socket.id)) return;
-    io.to(client.roomCode).emit("reaction", { emoji, username: client.username.slice(0, 32) });
   });
 
   socket.on("vote_skip", () => {
