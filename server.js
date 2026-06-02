@@ -1,7 +1,8 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const cors = require("cors");
+const cors   = require("cors");
+const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
@@ -25,7 +26,7 @@ function generateRoomCode() {
   let code;
   do {
     code = Array.from({ length: 6 }, () =>
-      ROOM_CODE_CHARS[Math.floor(Math.random() * ROOM_CODE_CHARS.length)]
+      ROOM_CODE_CHARS[crypto.randomInt(ROOM_CODE_CHARS.length)]
     ).join("");
   } while (rooms.has(code));
   return code;
@@ -40,26 +41,46 @@ function finalizeHostRegistration(socket, code, safeUsername) {
   broadcastRoomUpdate(code);
 }
 
+const registerAttempts = new Map();
+const REGISTER_LIMIT  = 5;
+const REGISTER_WINDOW = 60_000;
+
+function checkRateLimit(ip) {
+  const now   = Date.now();
+  const entry = registerAttempts.get(ip);
+  if (!entry || now > entry.resetAt) {
+    registerAttempts.set(ip, { count: 1, resetAt: now + REGISTER_WINDOW });
+    return true;
+  }
+  if (entry.count >= REGISTER_LIMIT) return false;
+  entry.count++;
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of registerAttempts)
+    if (now > entry.resetAt) registerAttempts.delete(ip);
+}, REGISTER_WINDOW).unref();
+
 app.get("/status", (req, res) => {
-  res.json({
-    totalClients: clients.size,
-    rooms: [...rooms.entries()].map(([code, r]) => ({
-      code,
-      hosts: r.hostId ? 1 : 0,
-      guests: r.guests.size,
-      cohostMode: r.cohostMode,
-    })),
-  });
+  let hosts = 0, guests = 0;
+  for (const c of clients.values()) c.role === "host" ? hosts++ : guests++;
+  res.json({ connected: clients.size, hosts, guests });
 });
 
 io.on("connection", (socket) => {
   console.log(`[+] Client connected: ${socket.id}`);
 
   socket.on("register", (data) => {
+    if (clients.has(socket.id)) return;
     if (!data || typeof data !== "object") return;
-    // Item 9: reject incompatible protocol versions
     if (data.version !== PROTOCOL_VERSION) {
       socket.emit("error", { message: `Version incompatible (got ${data.version}, expected ${PROTOCOL_VERSION}). Update your extension.` });
+      return;
+    }
+    if (!checkRateLimit(socket.handshake.address)) {
+      socket.emit("error", { message: "Too many attempts. Try again in a minute." });
       return;
     }
     const { role, username, roomCode } = data;
@@ -100,11 +121,15 @@ io.on("connection", (socket) => {
         socket.emit("error", { message: "Room not found. Check the code and try again." });
         return;
       }
+      if (room.guests.size >= 10) {
+        socket.emit("error", { message: "Room is full (max 10 guests)." });
+        return;
+      }
       room.guests.add(socket.id);
       clients.set(socket.id, { role: "guest", username: safeUsername, roomCode: safeCode });
       socket.join(safeCode);
       socket.emit("registered", { role: "guest", username: safeUsername });
-      socket.emit("cohost_mode_changed", { enabled: room.cohostMode });
+      if (room.cohostMode) socket.emit("cohost_mode_changed", { enabled: true });
       if (!room.hostId) socket.emit("waiting_for_host");
       console.log(`[~] ${safeUsername} joined room ${safeCode} as guest`);
       broadcastRoomUpdate(safeCode);
@@ -124,7 +149,7 @@ io.on("connection", (socket) => {
   socket.on("play", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
-    if (typeof data.uri !== "string") return;
+    if (typeof data.uri !== "string" || !data.uri.startsWith("spotify:")) return;
     socket.to(client.roomCode).emit("play", {
       uri:        data.uri,
       position:   typeof data.position === "number" ? data.position : 0,
@@ -153,7 +178,7 @@ io.on("connection", (socket) => {
   socket.on("change_track", (data) => {
     const client = clients.get(socket.id);
     if (!client || !canControl(socket.id) || !data || typeof data !== "object") return;
-    if (typeof data.uri !== "string") return;
+    if (typeof data.uri !== "string" || !data.uri.startsWith("spotify:")) return;
     console.log(`[>>|] room ${client.roomCode} change_track: ${data.uri}`);
     socket.to(client.roomCode).emit("change_track", {
       uri:        data.uri,
@@ -180,7 +205,7 @@ io.on("connection", (socket) => {
   socket.on("sync_state", (data) => {
     const client = clients.get(socket.id);
     if (!client || client.role !== "host" || !data || typeof data !== "object") return;
-    if (typeof data.guestId !== "string" || typeof data.uri !== "string") return;
+    if (typeof data.guestId !== "string" || typeof data.uri !== "string" || !data.uri.startsWith("spotify:")) return;
     // Fix 1: verify target belongs to the same room as the sending host
     const targetClient = clients.get(data.guestId);
     if (!targetClient || targetClient.roomCode !== client.roomCode) return;
