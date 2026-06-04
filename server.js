@@ -37,12 +37,22 @@ const ADMIN_TOKEN_HASH = ADMIN_TOKEN
 let totalConnections = 0;   // cumulative successful registrations
 let peakConnections  = 0;   // max simultaneous clients
 const connectionLog  = [];  // last 10 { username, role, roomCode, at }
+const serverStartTime = Date.now();
+let maintenanceMode  = false;
+let roomsCreatedToday = 0;
+let roomsCountDate    = new Date().toDateString();
 
 function recordConnection(username, role, roomCode) {
   totalConnections++;
   connectionLog.push({ username, role, roomCode, at: Date.now() });
   if (connectionLog.length > 10) connectionLog.shift();
   if (clients.size > peakConnections) peakConnections = clients.size;
+}
+
+function bumpRoomsToday() {
+  const today = new Date().toDateString();
+  if (today !== roomsCountDate) { roomsCountDate = today; roomsCreatedToday = 0; }
+  roomsCreatedToday++;
 }
 
 // Admin endpoint rate limit: 1 request / 5s per IP
@@ -75,21 +85,33 @@ function adminAuth(req, res) {
 }
 
 function buildAdminSnapshot() {
+  // Lazily reset the daily counter if the day rolled over with no new room.
+  const today = new Date().toDateString();
+  if (today !== roomsCountDate) { roomsCountDate = today; roomsCreatedToday = 0; }
+
   const roomList = [];
   for (const [code, room] of rooms) {
     const members = [];
     if (room.hostId) {
       const h = clients.get(room.hostId);
-      if (h) members.push({ username: h.username, role: "host", connectedAt: h.connectedAt });
+      if (h) members.push({ id: room.hostId, username: h.username, role: "host", connectedAt: h.connectedAt });
     }
     for (const gid of room.guests) {
       const g = clients.get(gid);
-      if (g) members.push({ username: g.username, role: room.cohostMode ? "cohost" : "guest", connectedAt: g.connectedAt });
+      if (g) members.push({ id: gid, username: g.username, role: room.cohostMode ? "cohost" : "guest", connectedAt: g.connectedAt });
     }
-    roomList.push({ code, cohostMode: room.cohostMode, memberCount: members.length, members });
+    roomList.push({ code, cohostMode: room.cohostMode, memberCount: members.length, currentUri: room.currentUri || null, members });
   }
   return {
-    stats: { connected: clients.size, activeRooms: rooms.size, totalConnections, peakConnections },
+    stats: {
+      connected: clients.size,
+      activeRooms: rooms.size,
+      totalConnections,
+      peakConnections,
+      roomsCreatedToday,
+      uptimeMs: Date.now() - serverStartTime,
+      maintenance: maintenanceMode,
+    },
     rooms: roomList,
     connectionLog: [...connectionLog].reverse(),
   };
@@ -210,12 +232,52 @@ app.post("/admin/kick", (req, res) => {
   res.json({ ok: true, kicked: ids.length });
 });
 
+// --- Admin: kick a single participant by socket id ---
+app.options("/admin/kick-participant", (req, res) => { adminCors(res); res.status(204).end(); });
+app.post("/admin/kick-participant", (req, res) => {
+  adminCors(res);
+  if (!adminAuth(req, res)) return;
+  const id = String(req.body?.id || "");
+  const s = io.sockets.sockets.get(id);
+  if (!s || !clients.has(id)) return res.status(404).json({ error: "Participant not found" });
+  s.emit("kicked");
+  s.disconnect(true);
+  console.log(`[admin] kicked participant ${id}`);
+  res.json({ ok: true });
+});
+
+// --- Admin: broadcast a message to every connected client ---
+app.options("/admin/broadcast", (req, res) => { adminCors(res); res.status(204).end(); });
+app.post("/admin/broadcast", (req, res) => {
+  adminCors(res);
+  if (!adminAuth(req, res)) return;
+  const text = String(req.body?.text || "").slice(0, 200).trim();
+  if (!text) return res.status(400).json({ error: "Empty message" });
+  io.emit("admin_message", { text });
+  console.log(`[admin] broadcast: ${text}`);
+  res.json({ ok: true, reached: clients.size });
+});
+
+// --- Admin: toggle maintenance mode (refuse new registrations) ---
+app.options("/admin/maintenance", (req, res) => { adminCors(res); res.status(204).end(); });
+app.post("/admin/maintenance", (req, res) => {
+  adminCors(res);
+  if (!adminAuth(req, res)) return;
+  maintenanceMode = Boolean(req.body?.enabled);
+  console.log(`[admin] maintenance mode: ${maintenanceMode ? "ON" : "OFF"}`);
+  res.json({ ok: true, maintenance: maintenanceMode });
+});
+
 io.on("connection", (socket) => {
   console.log(`[+] Client connected: ${socket.id}`);
 
   socket.on("register", (data) => {
     if (clients.has(socket.id)) return;
     if (!data || typeof data !== "object") return;
+    if (maintenanceMode) {
+      socket.emit("error", { message: "Server is under maintenance — try again later." });
+      return;
+    }
     if (data.version !== PROTOCOL_VERSION) {
       socket.emit("error", { message: `Version incompatible (got ${data.version}, expected ${PROTOCOL_VERSION}). Update your extension.` });
       return;
@@ -259,7 +321,8 @@ io.on("connection", (socket) => {
           return;
         }
       }
-      rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false, skipVotes: new Set() });
+      rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false, skipVotes: new Set(), currentUri: null });
+      bumpRoomsToday();
       finalizeHostRegistration(socket, code, safeUsername);
       recordConnection(safeUsername, "host", code);
       broadcastParticipants(code);
@@ -311,6 +374,8 @@ io.on("connection", (socket) => {
     if (typeof data.uri !== "string" || !SPOTIFY_URI_RE.test(data.uri)) return;
     // Fix 6: rate limit
     if (!checkEventRate(socket.id)) return;
+    const playRoom = rooms.get(client.roomCode);
+    if (playRoom) playRoom.currentUri = data.uri;
     broadcastPlayback(socket, client, "play", {
       uri:        data.uri,
       position:   safePosition(data.position),
@@ -351,6 +416,7 @@ io.on("connection", (socket) => {
     if (!checkEventRate(socket.id)) return;
     console.log(`[>>|] room ${client.roomCode} change_track: ${data.uri}`);
     const rtRoom = rooms.get(client.roomCode);
+    if (rtRoom) rtRoom.currentUri = data.uri;
     if (rtRoom?.skipVotes?.size) { rtRoom.skipVotes.clear(); io.to(client.roomCode).emit("skip_votes_cleared"); }
     broadcastPlayback(socket, client, "change_track", {
       uri:        data.uri,
@@ -399,6 +465,8 @@ io.on("connection", (socket) => {
     if (!client || client.role !== "host" || !data || typeof data !== "object") return;
     if (typeof data.uri !== "string" || !SPOTIFY_URI_RE.test(data.uri)) return;
     if (!checkEventRate(socket.id)) return;
+    const pingRoom = rooms.get(client.roomCode);
+    if (pingRoom) pingRoom.currentUri = data.uri;
     broadcastPlayback(socket, client, "sync_ping", {
       uri:       data.uri,
       position:  safePosition(data.position),
