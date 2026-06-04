@@ -24,6 +24,77 @@ const rooms = new Map();
 // clients: Map<socketId, { role, username, roomCode }>
 const clients = new Map();
 
+// --- Admin dashboard ---
+// Token lives only in the ADMIN_TOKEN env var (Render dashboard), never in code.
+// Client sends SHA-256(token); we compare it (timing-safe) to SHA-256(ADMIN_TOKEN).
+// NOTE: over HTTPS this client-side hashing adds no security — the hash IS the
+// effective credential. HTTPS + secret env var + timing-safe compare are the
+// real protections here.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+const ADMIN_TOKEN_HASH = ADMIN_TOKEN
+  ? crypto.createHash("sha256").update(ADMIN_TOKEN).digest("hex")
+  : null;
+let totalConnections = 0;   // cumulative successful registrations
+let peakConnections  = 0;   // max simultaneous clients
+const connectionLog  = [];  // last 10 { username, role, roomCode, at }
+
+function recordConnection(username, role, roomCode) {
+  totalConnections++;
+  connectionLog.push({ username, role, roomCode, at: Date.now() });
+  if (connectionLog.length > 10) connectionLog.shift();
+  if (clients.size > peakConnections) peakConnections = clients.size;
+}
+
+// Admin endpoint rate limit: 1 request / 5s per IP
+const adminAttempts = new Map();
+function checkAdminRate(ip) {
+  const now = Date.now();
+  const until = adminAttempts.get(ip);
+  if (until && now < until) return false;
+  adminAttempts.set(ip, now + 5000);
+  return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, until] of adminAttempts) if (now > until) adminAttempts.delete(ip);
+}, 60_000).unref();
+
+function adminCors(res) {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Headers", "x-admin-token, content-type");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+}
+
+function adminAuth(req, res) {
+  if (!ADMIN_TOKEN_HASH) { res.status(503).json({ error: "Admin disabled (no ADMIN_TOKEN set)" }); return false; }
+  const provided = String(req.get("x-admin-token") || "");
+  const a = Buffer.from(provided);
+  const b = Buffer.from(ADMIN_TOKEN_HASH);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) { res.status(401).json({ error: "Unauthorized" }); return false; }
+  return true;
+}
+
+function buildAdminSnapshot() {
+  const roomList = [];
+  for (const [code, room] of rooms) {
+    const members = [];
+    if (room.hostId) {
+      const h = clients.get(room.hostId);
+      if (h) members.push({ username: h.username, role: "host", connectedAt: h.connectedAt });
+    }
+    for (const gid of room.guests) {
+      const g = clients.get(gid);
+      if (g) members.push({ username: g.username, role: room.cohostMode ? "cohost" : "guest", connectedAt: g.connectedAt });
+    }
+    roomList.push({ code, cohostMode: room.cohostMode, memberCount: members.length, members });
+  }
+  return {
+    stats: { connected: clients.size, activeRooms: rooms.size, totalConnections, peakConnections },
+    rooms: roomList,
+    connectionLog: [...connectionLog].reverse(),
+  };
+}
+
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 // Fix 11: max attempts to avoid infinite loop
@@ -112,6 +183,33 @@ app.get("/status", (req, res) => {
   res.json({ connected: clients.size, hosts, guests });
 });
 
+// --- Admin: live snapshot of rooms, stats and connection log ---
+app.options("/admin", (req, res) => { adminCors(res); res.status(204).end(); });
+app.get("/admin", (req, res) => {
+  adminCors(res);
+  if (!checkAdminRate(req.socket.remoteAddress)) return res.status(429).json({ error: "Rate limited (1 req / 5s)" });
+  if (!adminAuth(req, res)) return;
+  res.json(buildAdminSnapshot());
+});
+
+// --- Admin: kick an entire room ---
+app.options("/admin/kick", (req, res) => { adminCors(res); res.status(204).end(); });
+app.post("/admin/kick", (req, res) => {
+  adminCors(res);
+  if (!adminAuth(req, res)) return;
+  const code = String(req.body?.code || "").toUpperCase().trim();
+  const room = rooms.get(code);
+  if (!room) return res.status(404).json({ error: "Room not found" });
+  const ids = [room.hostId, ...room.guests].filter(Boolean);
+  for (const id of ids) {
+    const s = io.sockets.sockets.get(id);
+    if (s) { s.emit("kicked"); s.disconnect(true); }
+  }
+  rooms.delete(code);
+  console.log(`[admin] kicked room ${code} (${ids.length} sockets)`);
+  res.json({ ok: true, kicked: ids.length });
+});
+
 io.on("connection", (socket) => {
   console.log(`[+] Client connected: ${socket.id}`);
 
@@ -145,6 +243,7 @@ io.on("connection", (socket) => {
           finalizeHostRegistration(socket, requested, safeUsername);
           socket.emit("cohost_mode_changed", { enabled: false });
           console.log(`[~] ${safeUsername} reclaimed room ${requested}`);
+          recordConnection(safeUsername, "host", requested);
           broadcastParticipants(requested);
           if (existing.guests.size > 0) socket.to(requested).emit("host_connected");
           // Fix 15: reset rate limit on successful registration
@@ -162,6 +261,7 @@ io.on("connection", (socket) => {
       }
       rooms.set(code, { hostId: socket.id, guests: new Set(), cohostMode: false, skipVotes: new Set() });
       finalizeHostRegistration(socket, code, safeUsername);
+      recordConnection(safeUsername, "host", code);
       broadcastParticipants(code);
       // Fix 15: reset rate limit on successful registration
       registerAttempts.delete(socket.handshake.address);
@@ -186,6 +286,7 @@ io.on("connection", (socket) => {
       // Fix 15: reset rate limit on successful registration
       registerAttempts.delete(socket.handshake.address);
       console.log(`[~] ${safeUsername} joined room ${safeCode} as guest`);
+      recordConnection(safeUsername, "guest", safeCode);
       broadcastRoomUpdate(safeCode);
       broadcastParticipants(safeCode);
     }
@@ -418,38 +519,6 @@ io.on("connection", (socket) => {
     const targetSock = io.sockets.sockets.get(targetId);
     if (targetSock) { targetSock.emit("kicked"); targetSock.disconnect(true); }
   });
-
-  socket.on("promote_guest", (data) => {
-    const client = clients.get(socket.id);
-    if (!client || client.role !== "host" || !data || typeof data !== "object") return;
-    const room = rooms.get(client.roomCode);
-    if (!room) return;
-    const targetId = typeof data.targetId === "string" ? data.targetId : null;
-    if (!targetId || !room.guests.has(targetId)) return;
-    const targetClient = clients.get(targetId);
-    if (!targetClient) return;
-    room.hostId = targetId;
-    room.guests.delete(targetId);
-    room.guests.add(socket.id);
-    clients.set(targetId, { ...targetClient, role: "host" });
-    clients.set(socket.id, { ...client, role: "guest" });
-    console.log(`[~] ${client.username} promoted ${targetClient.username} to host in ${client.roomCode}`);
-    io.sockets.sockets.get(targetId)?.emit("promoted_to_host");
-    broadcastRoomUpdate(client.roomCode);
-    broadcastParticipants(client.roomCode);
-  });
-
-  socket.on("kick_participant", (data) => {
-    const client = clients.get(socket.id);
-    if (!client || client.role !== "host" || !data || typeof data !== "object") return;
-    const room = rooms.get(client.roomCode);
-    if (!room) return;
-    const targetId = typeof data.targetId === "string" ? data.targetId : null;
-    if (!targetId || !room.guests.has(targetId)) return;
-    if (!checkEventRate(socket.id)) return;
-    const targetSock = io.sockets.sockets.get(targetId);
-    if (targetSock) { targetSock.emit("kicked"); targetSock.disconnect(true); }
-  });
 });
 
 function canControl(socketId) {
@@ -458,21 +527,6 @@ function canControl(socketId) {
   const room = rooms.get(c.roomCode);
   if (!room) return false;
   return c.role === "host" || (c.role === "guest" && room.cohostMode);
-}
-
-function broadcastParticipants(roomCode) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  const list = [];
-  if (room.hostId) {
-    const h = clients.get(room.hostId);
-    if (h) list.push({ id: room.hostId, username: h.username, role: "host", connectedAt: h.connectedAt });
-  }
-  for (const gId of room.guests) {
-    const g = clients.get(gId);
-    if (g) list.push({ id: gId, username: g.username, role: room.cohostMode ? "cohost" : "guest", connectedAt: g.connectedAt });
-  }
-  io.to(roomCode).emit("participants_update", { participants: list });
 }
 
 function broadcastParticipants(roomCode) {
