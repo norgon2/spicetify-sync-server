@@ -186,10 +186,16 @@ function safePosition(v, fallback = 0) {
 }
 
 // Broadcast playback to all room members except the sender.
-// When the sender is a guest co-host, the host is included so playback
-// stays in sync for everyone.
+// Guest co-host events reach the host for play/pause/change_track so the
+// host follows the co-host. Seek events from guests exclude the host to
+// prevent seek ping-pong (both sides have active seek polls).
 function broadcastPlayback(socket, client, event, data) {
-  io.to(client.roomCode).except(socket.id).emit(event, data);
+  const excluded = [socket.id];
+  if (client.role === "guest" && event === "seek") {
+    const room = rooms.get(client.roomCode);
+    if (room?.hostId) excluded.push(room.hostId);
+  }
+  io.to(client.roomCode).except(excluded).emit(event, data);
 }
 
 // Fix 7: /status is localhost-only
