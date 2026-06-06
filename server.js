@@ -17,7 +17,7 @@ const PROTOCOL_VERSION = 1;
 const MAX_POSITION_MS  = 86400000;
 
 // Fix 5: strict Spotify URI pattern, same as client
-const SPOTIFY_URI_RE = /^spotify:[a-z]+:[A-Za-z0-9]{22}$/;
+const SPOTIFY_URI_RE = /^spotify:[a-z]+:[A-Za-z0-9][A-Za-z0-9:_.+-]{1,149}$/;
 
 // rooms: Map<roomCode, { hostId: string|null, guests: Set<string>, cohostMode: boolean }>
 const rooms = new Map();
