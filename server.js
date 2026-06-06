@@ -185,13 +185,11 @@ function safePosition(v, fallback = 0) {
     : fallback;
 }
 
-// Fix 14: broadcast playback to room, excluding sender; if sender is guest co-host,
-// also exclude the host (host controls their own playback independently).
+// Broadcast playback to all room members except the sender.
+// When the sender is a guest co-host, the host is included so playback
+// stays in sync for everyone.
 function broadcastPlayback(socket, client, event, data) {
-  const room     = rooms.get(client.roomCode);
-  const excluded = [socket.id];
-  if (client.role === "guest" && room?.hostId) excluded.push(room.hostId);
-  io.to(client.roomCode).except(excluded).emit(event, data);
+  io.to(client.roomCode).except(socket.id).emit(event, data);
 }
 
 // Fix 7: /status is localhost-only
